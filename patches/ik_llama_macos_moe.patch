@@ -1,0 +1,272 @@
+diff --git a/ggml/include/ggml-metal.h b/ggml/include/ggml-metal.h
+index d483cf1..bdba3ab 100644
+--- a/ggml/include/ggml-metal.h
++++ b/ggml/include/ggml-metal.h
+@@ -46,6 +46,11 @@ GGML_API ggml_backend_t ggml_backend_metal_init(void);
+ 
+ GGML_API bool ggml_backend_is_metal(ggml_backend_t backend);
+ 
++// Apple Silicon unified memory: report what Metal will let us allocate.
++// Without this, llama_get_device_memory() falls through to `return 1;` and the
++// safety-margin check silently disables ALL GPU offload on macOS.
++GGML_API void ggml_backend_metal_get_device_memory(size_t * free, size_t * total);
++
+ GGML_API GGML_CALL ggml_backend_buffer_t ggml_backend_metal_buffer_from_ptr(void * data, size_t size, size_t max_size);
+ 
+ GGML_API void ggml_backend_metal_set_n_cb(ggml_backend_t backend, int n_cb);
+diff --git a/ggml/src/ggml-metal.m b/ggml/src/ggml-metal.m
+index 323d4e4..9e56151 100644
+--- a/ggml/src/ggml-metal.m
++++ b/ggml/src/ggml-metal.m
+@@ -4512,6 +4512,18 @@ ggml_backend_t ggml_backend_metal_init(void) {
+     return metal_backend;
+ }
+ 
++void ggml_backend_metal_get_device_memory(size_t * free, size_t * total) {
++    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
++    size_t rec = 0, cur = 0;
++    if (device) {
++        rec = (size_t) device.recommendedMaxWorkingSetSize;
++        cur = (size_t) device.currentAllocatedSize;
++        [device release];
++    }
++    if (total) *total = rec;
++    if (free)  *free  = rec > cur ? rec - cur : 0;
++}
++
+ bool ggml_backend_is_metal(ggml_backend_t backend) {
+     return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_metal_guid());
+ }
+diff --git a/ggml/src/ggml-moe-prefetch.cpp b/ggml/src/ggml-moe-prefetch.cpp
+index 52075f6..9272298 100644
+--- a/ggml/src/ggml-moe-prefetch.cpp
++++ b/ggml/src/ggml-moe-prefetch.cpp
+@@ -1,6 +1,6 @@
+ #include "ggml-moe-prefetch.h"
+ 
+-#if defined(__linux__)
++#if defined(__linux__) || defined(__APPLE__)
+ 
+ #include <sys/mman.h>
+ #include <unistd.h>
+@@ -34,6 +34,26 @@ static constexpr size_t GGML_MOE_PREFETCH_MAX_QUEUE = 65536;
+ 
+ namespace {
+ 
++// bring [astart, astart+alen) resident; returns true if it did real work.
++// macOS has no MADV_POPULATE_READ, so we hint with MADV_WILLNEED and then
++// touch one byte per page, forcing residency on the prefetch worker thread
++// rather than on the compute thread's demand fault.
++static inline bool populate_range(void * astart, size_t alen) {
++#if defined(__APPLE__)
++    (void) madvise(astart, alen, MADV_WILLNEED);
++    const long page = sysconf(_SC_PAGESIZE);
++    volatile const char * p = (volatile const char *) astart;
++    char sink = 0;
++    for (size_t off = 0; off < alen; off += (size_t)page) {
++        sink ^= p[off];
++    }
++    (void) sink;
++    return true;
++#else
++    return madvise(astart, alen, MADV_POPULATE_READ) == 0;
++#endif
++}
++
+ struct mapping_entry {
+     uintptr_t base;
+     size_t    size;
+@@ -118,7 +138,12 @@ struct prefetch_pool {
+             return false;
+         }
+         unsigned char vec[GGML_MOE_PREFETCH_CHUNK/4096 + 2];
++#if defined(__APPLE__)
++        // macOS declares mincore(const void *, size_t, char *)
++        if (mincore((void *)astart, alen, (char *)vec) != 0) {
++#else
+         if (mincore((void *)astart, alen, vec) != 0) {
++#endif
+             return false;
+         }
+         for (size_t i = 0; i < npages; ++i) {
+@@ -147,7 +172,7 @@ struct prefetch_pool {
+             } else {
+                 const uintptr_t astart = j.addr & ~(uintptr_t)(page - 1);
+                 const size_t    alen   = ((j.addr + j.len + page - 1) & ~(uintptr_t)(page - 1)) - astart;
+-                if (madvise((void *)astart, alen, MADV_POPULATE_READ) == 0) {
++                if (populate_range((void *)astart, alen)) {
+                     bytes_populated.fetch_add(alen, std::memory_order_relaxed);
+                     done_read = true;
+                 } // on failure the fault path takes over
+@@ -326,14 +351,23 @@ void ggml_moe_prefetch_unregister_mapping(const void * base) {
+ }
+ 
+ static bool populate_read_supported() {
++#if defined(__APPLE__)
++    // macOS has no MADV_POPULATE_READ; we emulate it in populate_range() by
++    // hinting with MADV_WILLNEED and then touching one byte per page, which
++    // forces the pages resident on the worker thread instead of on the
++    // compute thread's demand fault. Always available.
++    return true;
++#else
+     const long page = sysconf(_SC_PAGESIZE);
+     void * p = mmap(nullptr, (size_t)page, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+     if (p == MAP_FAILED) return false;
+     const bool ok = madvise(p, (size_t)page, MADV_POPULATE_READ) == 0;
+     munmap(p, (size_t)page);
+     return ok;
++#endif
+ }
+ 
++
+ void ggml_moe_prefetch_set_n_threads(int n_threads) {
+     auto & s = state();
+     std::lock_guard<std::mutex> lock(s.pool_mtx);
+@@ -407,7 +441,14 @@ void ggml_moe_prefetch_cold(const struct ggml_tensor * w) {
+     const uintptr_t page_mask = (uintptr_t)sysconf(_SC_PAGESIZE) - 1;
+     for (const auto & c : chunks) {
+         const uintptr_t astart = c.first & ~page_mask;
++#if defined(__APPLE__)
++        // MADV_COLD (20) is not a valid macOS advice value -> EINVAL -> silent no-op.
++        // For file-backed read-only pages the usable lever is MS_INVALIDATE, which drops
++        // them from the unified buffer cache and frees room for incoming prefetches.
++        (void) msync((void *)astart, (size_t)(c.first + c.second - astart), MS_INVALIDATE);
++#else
+         (void) madvise((void *)astart, (size_t)(c.first + c.second - astart), MADV_COLD);
++#endif
+     }
+     pool->n_colded.fetch_add(chunks.size(), std::memory_order_relaxed);
+ }
+@@ -435,6 +476,57 @@ void ggml_moe_prefetch_wait(const struct ggml_tensor * w) {
+     });
+ }
+ 
++
++// Graph-level trunk lookahead: populate upcoming STATIC weights (plain MUL_MAT)
++// while the current node computes. Routed experts (MUL_MAT_ID) are skipped --
++// their ids are not known until the router runs, and the kernel hook covers them.
++
++// Trailing evict: release weights of nodes we have already finished with, so the
++// page cache has room for the lookahead. Working set is ~3x cache, so consumed
++// pages otherwise evict incoming prefetches (measured 1.68x page re-read).
++void ggml_trunk_evict_trailing(const struct ggml_cgraph * cgraph, int node_n) {
++    if (!cgraph) return;
++    const char * env = getenv("GGML_TRUNK_EVICT");
++    const int lag = env ? atoi(env) : 0;   // 0 = disabled by default
++    if (lag <= 0) return;
++    const int k = node_n - lag;
++    if (k < 0) return;
++    const struct ggml_tensor * n = cgraph->nodes[k];
++    if (!n) return;
++    for (int si = 0; si < 2; ++si) {
++        const struct ggml_tensor * w = n->src[si];
++        if (!w || !w->data) continue;
++        const size_t nb = ggml_nbytes(w);
++        if (nb < (1u << 20)) continue;
++        if (!is_mapped(w->data, nb)) continue;
++        const uintptr_t page_mask = (uintptr_t)sysconf(_SC_PAGESIZE) - 1;
++        const uintptr_t astart = ((uintptr_t)w->data) & ~page_mask;
++        const size_t alen = ((uintptr_t)w->data + nb) - astart;
++#if defined(__APPLE__)
++        (void) msync((void *)astart, alen, MS_INVALIDATE);
++#else
++        (void) madvise((void *)astart, alen, MADV_COLD);
++#endif
++    }
++}
++
++void ggml_trunk_prefetch_lookahead(const struct ggml_cgraph * cgraph, int node_n) {
++    if (!cgraph) return;
++    const char * env = getenv("GGML_TRUNK_LOOKAHEAD");
++    const int K = env ? atoi(env) : 16;
++    if (K <= 0) return;
++    const size_t MIN_BYTES = 1u << 20; // ignore small tensors
++    for (int k = node_n + 1; k < node_n + 1 + K && k < cgraph->n_nodes; ++k) {
++        const struct ggml_tensor * n = cgraph->nodes[k];
++        if (!n || n->op != GGML_OP_MUL_MAT) continue;
++        const struct ggml_tensor * w = n->src[0];
++        if (!w || !w->data) continue;
++        if (ggml_nbytes(w) < MIN_BYTES) continue;
++        if (!is_mapped(w->data, ggml_nbytes(w))) continue;
++        ggml_moe_prefetch_tensor(w);
++    }
++}
++
+ void ggml_moe_prefetch_kernel_hook(const struct ggml_tensor * node, int ith) {
+     if (ith != 0) return;
+     const ggml_tensor * w0; const ggml_tensor * w1; const ggml_tensor * ids;
+@@ -454,7 +546,7 @@ void ggml_moe_prefetch_kernel_hook(const struct ggml_tensor * node, int ith) {
+     ggml_moe_prefetch_node(node);
+ }
+ 
+-#else // !__linux__
++#else // !__linux__ && !__APPLE__
+ 
+ void ggml_moe_prefetch_register_mapping(const void *, size_t) {}
+ void ggml_moe_prefetch_unregister_mapping(const void *) {}
+@@ -465,6 +557,9 @@ void ggml_moe_prefetch_node(const struct ggml_tensor *) {}
+ void ggml_moe_prefetch_tensor(const struct ggml_tensor *) {}
+ void ggml_moe_prefetch_wait(const struct ggml_tensor *) {}
+ void ggml_moe_prefetch_kernel_hook(const struct ggml_tensor *, int) {}
++void ggml_trunk_prefetch_lookahead(const struct ggml_cgraph *, int) {}
++void ggml_trunk_evict_trailing(const struct ggml_cgraph *, int) {}
++
+ void ggml_moe_prefetch_cold(const struct ggml_tensor *) {}
+ 
+ #endif
+diff --git a/ggml/src/ggml-moe-prefetch.h b/ggml/src/ggml-moe-prefetch.h
+index 5e323d7..7a72f78 100644
+--- a/ggml/src/ggml-moe-prefetch.h
++++ b/ggml/src/ggml-moe-prefetch.h
+@@ -47,6 +47,17 @@ void ggml_moe_prefetch_cold(const struct ggml_tensor * w);
+ // madvise(MADV_WILLNEED) when the engine is off.
+ void ggml_moe_prefetch_kernel_hook(const struct ggml_tensor * node, int ith);
+ 
++// Graph-level TRUNK lookahead. Unlike routed experts, the attention/dense
++// weights of upcoming nodes live at static addresses with no dependency on
++// routing, so they can be populated while the current node computes.
++// On GLM-5.2 the trunk is ~72% of per-token bytes, so this is the dominant
++// streaming cost. Called by thread 0 before each node.
++void ggml_trunk_prefetch_lookahead(const struct ggml_cgraph * cgraph, int node_n);
++
++// Trailing evict (env GGML_TRUNK_EVICT=lag, 0=off): drop weights of nodes already
++// consumed so the page cache has room for lookahead. Working set is ~3x cache.
++void ggml_trunk_evict_trailing(const struct ggml_cgraph * cgraph, int node_n);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index a78ac0f..a9d0733 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -28879,6 +28879,13 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+ 
+         if (ggml_is_noop(node)) continue;
+ 
++        // trunk lookahead: static weights of upcoming nodes, populated in the
++        // background while this node computes (trunk is ~72% of MoE stream cost)
++        if (state->ith == 0 && cplan->moe_expert_prefetch) {
++            ggml_trunk_prefetch_lookahead(cgraph, node_n);
++            ggml_trunk_evict_trailing(cgraph, node_n);
++        }
++
+ #if IK_PRINT_TIMING
+         int64_t tim1 = ggml_time_us();
+ #endif
+diff --git a/src/llama.cpp b/src/llama.cpp
+index b7030db..63f0a7d 100644
+--- a/src/llama.cpp
++++ b/src/llama.cpp
+@@ -545,6 +545,11 @@ static size_t llama_get_device_memory(const llama_model & model, int device) {
+     size_t free;
+     ggml_backend_cann_get_device_memory(device, &free, &total);
+     return free;
++#elif defined(GGML_USE_METAL)
++    size_t total;
++    size_t free;
++    ggml_backend_metal_get_device_memory(&free, &total);
++    return free;
+ #else
+     return 1;
+ #endif

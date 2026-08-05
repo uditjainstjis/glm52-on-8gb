@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+"""
+glm — terminal chat for GLM-5.2 (753B, 1.63bpw) on an 8 GB Mac.
+Live token streaming + speed. Every reply is saved to ~/glm52/out/chat/.
+
+  glm                     interactive
+  glm "your question"     one-shot
+  NPRED=512 glm "..."     longer reply
+
+NOTE: the meter prints on its OWN line and never rewrites the reply text.
+(v1 used \r + clear-line and silently erased the model's output.)
+"""
+import json, os, sys, time, urllib.request, urllib.error, datetime, pathlib
+
+URL   = os.environ.get("URL", "http://localhost:8080")
+NPRED = int(os.environ.get("NPRED", "256"))
+OUT   = pathlib.Path.home() / "glm52" / "out" / "chat"
+OUT.mkdir(parents=True, exist_ok=True)
+
+C = dict(dim="\033[2m", red="\033[31m", grn="\033[32m", cyn="\033[36m",
+         ylw="\033[33m", bold="\033[1m", off="\033[0m")
+
+
+def up():
+    try:
+        urllib.request.urlopen(URL + "/health", timeout=3).read()
+        return True
+    except Exception:
+        return False
+
+
+def meter(el, n, ttft):
+    tps = n / el if el else 0
+    return (f"{C['dim']}    [{n} tok · {el:.0f}s · {el/n if n else 0:.1f} s/tok · "
+            f"{tps:.3f} tok/s · ttft {ttft:.0f}s]{C['off']}")
+
+
+def ask(q):
+    body = json.dumps({
+        "prompt": q, "n_predict": NPRED, "stream": True,
+        "temperature": 1.0, "top_p": 0.95, "repeat_penalty": 1.05,
+    }).encode()
+    req = urllib.request.Request(URL + "/completion", data=body,
+                                 headers={"Content-Type": "application/json"})
+    t0 = time.time(); n = 0; ttft = None; last = 0.0; buf = []
+    print()
+    try:
+        with urllib.request.urlopen(req) as r:
+            for raw in r:
+                line = raw.decode("utf-8", "replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                try:
+                    d = json.loads(line[5:].strip())
+                except Exception:
+                    continue
+                tok = d.get("content", "")
+                if tok:
+                    if ttft is None:
+                        ttft = time.time() - t0
+                    n += 1
+                    buf.append(tok)
+                    sys.stdout.write(C["grn"] + tok + C["off"])
+                    sys.stdout.flush()
+                    now = time.time()
+                    if now - last > 30:            # own line, never overwrites text
+                        last = now
+                        print("\n" + meter(now - t0, n, ttft or 0))
+                if d.get("stop"):
+                    break
+    except urllib.error.URLError as e:
+        print(f"\n{C['red']}  connection lost: {e}{C['off']}")
+    except KeyboardInterrupt:
+        print(f"\n{C['ylw']}  interrupted{C['off']}")
+
+    el = time.time() - t0
+    text = "".join(buf)
+    print("\n" + meter(el, n, ttft or 0))
+
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    p = OUT / f"{stamp}.txt"
+    p.write_text(f"PROMPT:\n{q}\n\nRESPONSE ({n} tok, {el:.0f}s, "
+                 f"{el/n if n else 0:.2f} s/tok, ttft {ttft or 0:.0f}s):\n{text}\n")
+    print(f"{C['dim']}    saved: {p}{C['off']}")
+    return text
+
+
+def main():
+    if not up():
+        print(f"{C['red']}server not up at {URL}{C['off']}")
+        print("  start:  nohup bash ~/glm52/scripts/chat.sh >/dev/null 2>&1 &")
+        print("  watch:  tail -f ~/glm52/out/server.log     (~12 min to load)")
+        sys.exit(1)
+
+    if len(sys.argv) > 1:
+        q = " ".join(sys.argv[1:])
+        print(f"{C['cyn']}{C['bold']}> {q}{C['off']}")
+        ask(q)
+        return
+
+    print(f"{C['bold']}GLM-5.2{C['off']} {C['dim']}753B · 1.63bpw · all 19,200 experts · "
+          f"8 GB Mac · ~16 s/token{C['off']}")
+    print(f"{C['dim']}Ctrl-C stops a reply · Ctrl-D quits · replies saved to {OUT}{C['off']}")
+    while True:
+        try:
+            q = input(f"\n{C['cyn']}{C['bold']}you>{C['off']} ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if q:
+            ask(q)
+
+
+if __name__ == "__main__":
+    main()
