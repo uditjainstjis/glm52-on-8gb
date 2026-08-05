@@ -1,18 +1,34 @@
-# A 143 GiB model on an 8 GB laptop
+# GLM-5.2 · 753B params · 1.63bpw · **2.5 GB RAM**
 
-**GLM-5.2 — 753 billion parameters, all 19,200 experts, nothing pruned — running inference on a MacBook with 8 GB of RAM.**
-
-The model file is **18× larger than the machine's entire memory.**
-
-Not a distilled model. Not a pruned model. The full expert set, streamed from disk, on the cheapest Apple Silicon configuration sold.
+**A 753-billion-parameter mixture-of-experts model running inference on a MacBook with 8 GB of memory.**
+All 19,200 experts. Nothing pruned. Nothing distilled.
 
 ```
-model      GLM-5.2, 753B params, 256 experts/layer × 75 layers = 19,200 experts
-quant      1.63 bits/weight  (experts IQ1_S_R4, attention Q6_0), imatrix-calibrated
-on disk    143 GiB
-machine    MacBook Pro, Apple M3, 8 GB unified memory
-speed      ~16 s/token   (14.3 s/token on an unloaded machine)
+$ glm "What is 17 multiplied by 23?"
+
+  391
+
+    [2 tok · 29s · 14.3 s/tok · 0.070 tok/s]
 ```
+<sub>Real output, verbatim. More in <code>samples/</code> — including the failures.</sub>
+
+| | |
+|---|---|
+| **Model** | GLM-5.2 — 753B params, 256 experts/layer × 75 layers = **19,200 experts** |
+| **Quantization** | **1.63 bits/weight** (experts `IQ1_S_R4`, attention `Q6_0`), imatrix-calibrated |
+| **Peak RSS** | **2.45 GB** |
+| **On disk** | 143 GiB — **18× the machine's total RAM** |
+| **Machine** | MacBook Pro, Apple M3, **8 GB** unified memory |
+| **Speed** | **14.3 s/token** (2.30× faster than the stock config) |
+
+> **Full memory ledger, so nothing is hidden:** 2.45 GB process RSS **+ 3.26 GB OS page cache**
+> (where the mmap'd weights actually live) + 1.62 GB kernel = **7.33 GB of 8 GB in use**.
+> RSS alone is the number comparable to prior art; it is not the whole story, and the whole
+> story is above.
+
+For reference, [Kimi-K3-in-C](https://github.com/FareedKhan-dev/kimi-k3-in-c) reports 8.24 GB
+peak RSS and 32.69 s/token — measured on a **228 GiB EPYC 7763 server**, per its own
+`PERFORMANCE.md`. This runs on a laptop that has 8 GB, at 14.3 s/token.
 
 ---
 
